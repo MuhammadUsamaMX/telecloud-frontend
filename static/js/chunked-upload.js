@@ -13,6 +13,14 @@ const MAX_ATTEMPTS = 8;            // counted failures per chunk (network, 5xx, 
 const MAX_BUSY_WAIT_MS = 20 * 60 * 1000; // cumulative 429/503/in-progress waiting per chunk
 const HASH_STEP = 2 * MIB;
 const FINALIZE_TIMEOUT_MS = 30 * 60 * 1000; // stop polling a stuck 'finalizing' session
+const TARGET_CHUNK_SECONDS = 40;   // aim for each chunk request to finish well under Cloudflare's ~100 s limit
+const MIN_CHUNK = 4 * MIB;
+const FALLBACK_CHUNK = 16 * MIB;   // used when the upload speed could not be measured
+const PROBE_WARMUP_BYTES = 256 * 1024;
+const PROBE_BYTES = 4 * MIB;
+const PROBE_TIMEOUT_MS = 20 * 1000;
+const SPEED_TTL_MS = 5 * 60 * 1000;      // a measured speed is reused for a queue of files
+const SPEED_FAIL_TTL_MS = 60 * 1000;     // do not re-probe (up to 20 s) for every file after a failure
 
 // ---------------------------------------------------------------------------
 // Incremental SHA-256 (FIPS 180-4). crypto.subtle cannot stream, so the
@@ -160,6 +168,91 @@ export function createXhrTransport(getCsrfToken) {
 function abortError() { const e = new Error('aborted'); e.name = 'AbortError'; return e; }
 function networkError(msg) { const e = new Error(msg); e.network = true; return e; }
 
+// ---------------------------------------------------------------------------
+// Adaptive chunk size. The chunk size is fixed per session (sent in the create
+// call), so it is picked from a quick upload-speed probe before POST /api/uploads.
+// ---------------------------------------------------------------------------
+
+/**
+ * chunk = floor(bytesPerSec * targetSeconds / parallel), clamped to [minBytes, ceiling]
+ * and rounded down to a whole MiB. An unusable speed yields min(ceiling, 16 MiB).
+ * The ceiling always wins over minBytes (a server that advertises less than 4 MiB).
+ */
+export function chooseChunkSize({ bytesPerSec, parallel = 1, ceiling, targetSeconds = TARGET_CHUNK_SECONDS, minBytes = MIN_CHUNK }) {
+    if (typeof bytesPerSec !== 'number' || !Number.isFinite(bytesPerSec) || bytesPerSec <= 0) {
+        return Math.min(ceiling, FALLBACK_CHUNK);
+    }
+    const streams = Math.max(1, parallel || 1);
+    const raw = Math.floor(bytesPerSec * targetSeconds / streams);
+    const clamped = Math.min(ceiling, Math.max(minBytes, raw));
+    return Math.max(MIB, Math.floor(clamped / MIB) * MIB);
+}
+
+/**
+ * Measures the upload speed (bytes/second) with POST /api/uploads/probe: a 256 KiB warm-up
+ * request, then a 4 MiB request of which only the second is timed (start of send to response).
+ * Returns null on any error, 429/503/other non-200, abort or timeout (hard limit 20 s).
+ * opts: { signal, timeoutMs, now }   (now: test seam, defaults to performance.now)
+ */
+export async function measureUploadSpeed(transport, opts = {}) {
+    const now = opts.now || (() => (globalThis.performance ? performance.now() : Date.now()));
+    const ac = new AbortController();
+    const outer = opts.signal;
+    const onOuterAbort = () => ac.abort();
+    if (outer) {
+        if (outer.aborted) return null;
+        outer.addEventListener('abort', onOuterAbort, { once: true });
+    }
+    let timer;
+    const deadline = new Promise((_, reject) => {
+        timer = setTimeout(() => { ac.abort(); reject(new Error('probe timeout')); }, opts.timeoutMs || PROBE_TIMEOUT_MS);
+    });
+    const post = (body) => transport({
+        method: 'POST', url: '/api/uploads/probe', body, signal: ac.signal,
+        headers: { 'Content-Type': 'application/octet-stream' },
+    });
+    const run = async () => {
+        const buf = new Uint8Array(PROBE_BYTES); // zero-filled; the warm-up sends a view of the same memory
+        const warm = await post(buf.subarray(0, PROBE_WARMUP_BYTES));
+        if (!warm || warm.status !== 200) return null;
+        const t0 = now();
+        const res = await post(buf);
+        const seconds = (now() - t0) / 1000;
+        if (!res || res.status !== 200) return null;
+        return PROBE_BYTES / Math.max(seconds, 0.001);
+    };
+    try {
+        return await Promise.race([run(), deadline]);
+    } catch (e) {
+        return null;
+    } finally {
+        clearTimeout(timer);
+        deadline.catch(() => {});
+        if (outer) outer.removeEventListener('abort', onOuterAbort);
+    }
+}
+
+// In-memory for the page lifetime; shared by every upload of a queue. Holds the pending
+// promise too, so files that start together share a single probe.
+const sharedSpeedCache = { entry: null };
+export function resetSpeedCache(cache = sharedSpeedCache) { cache.entry = null; }
+
+/** Cached measureUploadSpeed: ~5 min for a measurement, ~1 min for a failure (null). */
+export function getCachedUploadSpeed(transport, { cache = sharedSpeedCache, now, measure = measureUploadSpeed } = {}) {
+    const clock = now || (() => (globalThis.performance ? performance.now() : Date.now()));
+    const e = cache.entry;
+    if (e && clock() - e.at < e.ttl) return e.promise;
+    const entry = { at: clock(), ttl: SPEED_TTL_MS, promise: null };
+    // No per-upload signal here: one file being cancelled must not fail the probe the others wait on.
+    entry.promise = measure(transport, { now }).then((v) => {
+        entry.at = clock();
+        entry.ttl = v == null ? SPEED_FAIL_TTL_MS : SPEED_TTL_MS;
+        return v;
+    });
+    cache.entry = entry;
+    return entry.promise;
+}
+
 export class UploadError extends Error {
     constructor(code, message, extra = {}) {
         super(message || code);
@@ -208,7 +301,7 @@ const RESTART_CODES = new Set(['chunk_conflict', 'session_not_found', 'session_f
  * opts: {
  *   file, targetPath, overwrite, config (GET /api/uploads/config), transport,
  *   onProgress(uploadedBytes), onStatus(kind, info), onSession(id)   // all optional
- *   store, sleep, random, subtle                                     // test seams
+ *   store, sleep, random, subtle, speedCache, measureSpeed            // test seams
  * }
  * run() resolves {fileId, finalName}; rejects with UploadError (or AbortError after cancel()).
  */
@@ -355,14 +448,33 @@ export class SessionUpload {
         }
     }
 
+    // New sessions only: a resumed session keeps the chunk size it was created with.
+    async _pickChunkSize() {
+        const ceiling = this.chunkSize;
+        let bytesPerSec = null;
+        try {
+            this.status('probing');
+            const probe = getCachedUploadSpeed(this.req, { cache: this.o.speedCache || sharedSpeedCache, measure: this.o.measureSpeed || measureUploadSpeed });
+            // Stop waiting as soon as this upload is cancelled (the shared probe itself keeps running).
+            bytesPerSec = await Promise.race([probe, new Promise((_, reject) => {
+                if (this.ac.signal.aborted) return reject(abortError());
+                this.ac.signal.addEventListener('abort', () => reject(abortError()), { once: true });
+            })]);
+        } catch (e) {
+            if (e.name === 'AbortError') throw e;
+        }
+        return chooseChunkSize({ bytesPerSec, parallel: this.parallel, ceiling });
+    }
+
     async _create() {
+        const chunkSize = await this._pickChunkSize();
         const res = await this._call('POST', '/api/uploads', {
             filename: this.file.name,
             path: this.o.targetPath,
             size: this.file.size,
             mime_type: this.file.type || '',
             overwrite: !!this.o.overwrite,
-            chunk_size: this.chunkSize,
+            chunk_size: chunkSize,
         });
         this.sessionId = res.json.id;
         this._remember(this.sessionId);

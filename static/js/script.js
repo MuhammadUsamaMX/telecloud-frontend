@@ -3362,7 +3362,7 @@ function cloudApp(initialIsLoggedIn, isAdmin = true, storageUsed = 0, webdavEnab
                     if (!t || t.isCancelled) return;
                     if (kind === 'waiting') t.statusText = this.t('upload_server_busy', { seconds: info.seconds });
                     else if (kind === 'retry') t.statusText = `${progressText()} (${this.t('retry')} ${info.attempt})`;
-                    else if (kind === 'verifying') t.statusText = this.t('upload_verifying');
+                    else if (kind === 'verifying' || kind === 'probing') t.statusText = this.t('upload_verifying');
                     else if (kind === 'finalizing') { t.progress = 95; t.statusText = this.t('pushing_to_tg'); }
                 },
             });
